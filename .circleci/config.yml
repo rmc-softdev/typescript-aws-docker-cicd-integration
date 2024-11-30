@@ -1,108 +1,301 @@
+orbs:
+  slack: circleci/slack@4.2.0
 version: 2.1
+executors:
+  app-executor:
+    docker:
+      - image: circleci/node:stretch
+    working_directory: ~/repo
+  slack-executor:
+    docker:
+      - image: 'cibuilds/base:latest'
+    resource_class: small
+  terraform-executor:
+    docker:
+      - image: hashicorp/terraform:0.14.5
+
+
+aliases:
+  - &show-current-branch-name
+    run:
+      name: Show current branch
+      command: echo ${CIRCLE_BRANCH}
+  - &restore-cache
+    restore_cache:
+      keys:
+        - app-{{ checksum "package.json" }}
+        - app-
+  - &install-dependencies
+    run:
+      name: Install dependencies
+      command: |
+        mkdir -p artifacts
+        npm install
+  - &save-cache
+    save_cache:
+      paths:
+        - node_modules
+      key: app-{{ checksum "package.json" }}
+  - &install-aws-cli
+    run:
+      name: Installing AWS CLI
+      working_directory: /
+      command: |
+        sudo apt-get -y -qq update
+        sudo apt-get install -y awscli
+        sudo apt-get install -y python-pip python-dev build-essential
+  - &build-project
+    run:
+      name: Build Project
+      command: |
+        npm install
+        npm run build
+        cd build
+        zip ../build.zip -r * .[^.]*
+        echo "Build successful"
 
 jobs:
   build:
-    docker:
-      - image: circleci/node:carbon
-    working_directory: ~/repo
+    executor: app-executor
     steps:
       - checkout
+      - *show-current-branch-name
+      - *restore-cache
+      - *install-dependencies
+      - *save-cache
       - run:
-          name: Show current branch
-          command: echo ${CIRCLE_BRANCH}
-      - restore_cache:
-          keys: 
-            - app-{{checksum "package.json"}}
-            - app-
-      - run:
-          name: Install dependencies
-          command: npm install      
-      - save_cache:
+          name: Copy Infrastructure Folder
+          command: |
+            cp -r infrastructure artifacts/infrastructure
+      - persist_to_workspace:
+          root: ./
           paths:
-            - node_modules
-          key: app-{{checksum "package.json"}}
-  deploy-to-aws-s3:
-    docker:
-      - image: circleci/node:13.12.0
-    working_directory: ~/repo
+            - artifacts
+  linting:
+    executor: app-executor
     steps:
       - checkout
+      - *show-current-branch-name
+      - *restore-cache
       - run:
-          name: Show current branch
-          command: echo ${CIRCLE_BRANCH}
+          name: Run linting
+          command: npm run lint            
+            
+  prettier:
+    executor: app-executor
+    steps:
+      - checkout
+      - *show-current-branch-name
+      - *restore-cache
       - run:
-          name: Installing AWS CLI
-          working_directory: /
+          name: Run prettier check
+          command: npm run prettier:check
+  
+  terraform-validate:
+    executor: terraform-executor
+    steps:
+      - checkout
+      - *show-current-branch-name
+      - run:
+          name: Teforram validating and formating
           command: |
-            sudo apt-get -y -qq update
-            sudo apt-get install -y awscli
-            sudo apt-get install -y python-pip python-dev build-essential
-      - run: 
-          name: Build Project
+            cd infrastructure/
+            terraform init -backend=false
+            terraform validate
+            terraform fmt -check
+
+  terraform-plan-and-apply:
+    executor: terraform-executor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ./
+      - *show-current-branch-name
+      - run:
+          name: Terraform planning
           command: |
-            npm install
-            npm run build
-            cd build
-            zip ../build.zip -r * .[^.]*
-            echo "Build successfully"
+            cd artifacts/infrastructure/
+            terraform init
+            terraform workspace select ${CIRCLE_BRANCH} || terraform workspace new ${CIRCLE_BRANCH}
+            terraform plan
+      - run:
+          name: Terraform applying
+          command: |
+            cd artifacts/infrastructure/
+            terraform apply -auto-approve                      
+            terraform output aniworld_app_s3_bucket > ../aniworld_bucket_name.txt
+            terraform output cloudfront_distribution_id > ../cloudfront_distribution_id.txt
+      - persist_to_workspace:
+          root: ./
+          paths:
+            - artifacts                
+
+  deploy-to-aws-s3:
+    executor: app-executor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ./      
+      - *show-current-branch-name
+      - *install-aws-cli
+      - *build-project
       - run:
           name: Deploy to AWS S3
           command: |
+            AWS_BUCKET_NAME=$(cat artifacts/aniworld_bucket_name.txt | sed 's/\"//g')
+            echo $AWS_BUCKET_NAME
             if [ "${CIRCLE_BRANCH}" == "master" ]
             then
-              aws --region ${AWS_REGION} s3 sync ~/repo/build s3://${AWS_PRODUCTION_BUCKET} --delete
+              aws --region ${AWS_REGION} s3 sync ~/repo/build s3://${AWS_BUCKET_NAME} --delete
             elif [ "${CIRCLE_BRANCH}" == "staging" ]
             then
-              aws --region ${AWS_REGION} s3 sync ~/repo/build s3://${AWS_STAGING_BUCKET} --delete
+              aws --region ${AWS_REGION} s3 sync ~/repo/build s3://${AWS_BUCKET_NAME} --delete
             else
-              aws --region ${AWS_REGION} s3 sync ~/repo/build s3://${AWS_DEV_BUCKET} --delete
+              aws --region ${AWS_REGION} s3 sync ~/repo/build s3://${AWS_BUCKET_NAME} --delete
             fi
 
   deploy-to-aws-cloudfront:
-    docker:
-      - image: circleci/node:13.12.0
-    working_directory: ~/repo
+    executor: app-executor
     steps:
       - checkout
+      - attach_workspace:
+          at: ./         
+      - *show-current-branch-name
+      - *install-aws-cli
+      - *build-project
       - run:
-          name: Show current branch
-          command: echo ${CIRCLE_BRANCH}
-      - run:
-          name: Installing AWS CLI
-          working_directory: /
+          name: Deploy to AWS Cloudfront
           command: |
-            sudo apt-get -y -qq update
-            sudo apt-get install -y awscli
-            sudo apt-get install -y python-pip python-dev build-essential
-      - run: 
-          name: Build Project
-          command: |
-            npm install
-            npm run build
-            cd build
-            zip ../build.zip -r * .[^.]*
-            echo "Build successfully"
-      - run:
-          name: Deploy to AWS S3
-          command: |
+            CLOUDFRONT_DISTRIBUTION_ID=$(cat artifacts/cloudfront_distribution_id.txt | sed 's/\"//g')
+            echo $CLOUDFRONT_DISTRIBUTION_ID          
             aws configure set preview.cloudfront true
             if [ "${CIRCLE_BRANCH}" == "master" ]
             then
-              aws cloudfront create-invalidation --distribution-id ${PRODUCTION_DISTRIBUTION_ID} --paths /\*
+              aws cloudfront create-invalidation --distribution-id ${CLOUDFRONT_DISTRIBUTION_ID} --paths /\*
             elif [ "${CIRCLE_BRANCH}" == "staging" ]
             then
-              aws cloudfront create-invalidation --distribution-id ${STAGING_DISTRIBUTION_ID} --paths /\*
+              aws cloudfront create-invalidation --distribution-id ${CLOUDFRONT_DISTRIBUTION_ID} --paths /\*
             else
-              aws cloudfront create-invalidation --distribution-id ${DEV_DISTRIBUTION_ID} --paths /\*
-            fi     
+              aws cloudfront create-invalidation --distribution-id ${CLOUDFRONT_DISTRIBUTION_ID} --paths /\*
+            fi
+
+  notify-via-slack:
+    executor: slack-executor
+    steps:
+      - run: echo "Notifying slack channel"
+      - slack/notify:
+          event: 'always'
+          channel: 'development-circleci'
+          template: ''
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${CIRCLE_BRANCH} branch deployment to AWS S3 and Cloudfront is complete. 👍",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*:\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch*:\n$CIRCLE_BRANCH"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*When*:\n$(date +'%m/%d/%Y %T')"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Build*:\n$CIRCLE_BUILD_NUM"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*GithubUsername*:\n$CIRCLE_PROJECT_USERNAME"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  terraform-destroy:
+    executor: terraform-executor
+    steps:
+      - checkout
+      - *show-current-branch-name
+      - run:
+          name: Terraform Destroy
+          command: |
+            cd infrastructure/
+            terraform init
+            terraform workspace select ${CIRCLE_BRANCH} || terraform workspace new ${CIRCLE_BRANCH}
+            terraform destroy -auto-aprove
+
 
 workflows:
   build_and_deploy:
     jobs:
       - build
-      - deploy-to-aws-s3:
+      - linting:
           requires:
             - build
+          filters:
+            branches:
+              only:
+                - development
+                - staging
+                - master      
+      - prettier:
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - development
+                - staging
+                - master
+      - terraform-validate:
+          requires:
+            - linting
+            - prettier
+          filters:
+            branches:
+              only:
+                - development
+                - staging
+                - master
+      - terraform-plan-and-apply:
+          requires:
+            - terraform-validate
+          filters:
+            branches:
+              only:
+                - development
+                - staging
+                - master                                   
+      - deploy-to-aws-s3:
+          requires:
+            - terraform-plan-and-apply
           filters:
             branches:
               only:
@@ -112,6 +305,28 @@ workflows:
       - deploy-to-aws-cloudfront:
           requires:
             - deploy-to-aws-s3
+          filters:
+            branches:
+              only:
+                - development
+                - staging
+                - master
+      - notify-via-slack:
+          requires:
+            - deploy-to-aws-cloudfront
+          filters:
+            branches:
+              only:
+                - development
+                - staging
+                - master
+      - hold-tfdestroy:
+          type: approval
+          requires:
+            - deploy-to-aws-cloudfront
+      - terraform-destroy:
+          requires:
+            - hold-tfdestroy
           filters:
             branches:
               only:
